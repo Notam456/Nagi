@@ -939,7 +939,7 @@ public partial class App : Application
         if (hasFolders)
         {
             if (RootWindow.Content is not MainPage) RootWindow.Content = new MainPage();
-            await Services.GetRequiredService<LibraryViewModel>().InitializeAsync();
+            
         }
         else
         {
