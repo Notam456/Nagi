@@ -1,11 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.ApplicationModel;
@@ -224,7 +222,8 @@ public partial class App : Application
         catch (Exception ex)
         {
             Log.Fatal(ex, "Application terminated unexpectedly during startup.");
-            await ShowCrashReportAndExitAsync(ex);
+            await Log.CloseAndFlushAsync();
+            throw;
         }
     }
 
@@ -349,7 +348,7 @@ public partial class App : Application
             // These are independent and required for the next phase.
             var dbTask = InitializeDatabaseAsync(Services);
             var windowTask = Services.GetRequiredService<IWindowService>().InitializeAsync();
-            await Task.WhenAll(dbTask, windowTask).ConfigureAwait(false);
+            await Task.WhenAll(dbTask, windowTask);
 
             // 2. Services Phase: Parallelize independent service initializations.
             var playbackTask = Services.GetRequiredService<IMusicPlaybackService>().InitializeAsync(restoreSession);
@@ -361,7 +360,7 @@ public partial class App : Application
             var scrobbleTask = offlineScrobbleService.ProcessQueueAsync();
 
             // Wait for all non-dependent services to finish initializing.
-            await Task.WhenAll(playbackTask, presenceTask, trayTask, scrobbleTask).ConfigureAwait(false);
+            await Task.WhenAll(playbackTask, presenceTask, trayTask, scrobbleTask);
 
             _logger?.LogInformation("Core services initialized successfully.");
         }
@@ -381,34 +380,6 @@ public partial class App : Application
         services.AddSingleton(configuration);
         services.AddSingleton<IPathConfiguration, PathConfiguration>();
         services.AddHttpClient();
-        
-        // Configure named HTTP clients with strict timeouts for lyrics APIs
-        // Force HTTP/1.1 and limit connection lifetime to avoid "Response Ended Prematurely" 
-        // errors caused by servers closing idle connections that HttpClient tries to reuse
-        services.AddHttpClient("LrcLib")
-            .ConfigureHttpClient(client =>
-            {
-                client.Timeout = TimeSpan.FromSeconds(10);
-                client.DefaultRequestVersion = HttpVersion.Version11;
-                client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact;
-            })
-            .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-            {
-                PooledConnectionLifetime = TimeSpan.FromSeconds(30),
-                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
-            });
-        services.AddHttpClient("NetEase")
-            .ConfigureHttpClient(client =>
-            {
-                client.Timeout = TimeSpan.FromSeconds(10);
-                client.DefaultRequestVersion = HttpVersion.Version11;
-                client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact;
-            })
-            .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-            {
-                PooledConnectionLifetime = TimeSpan.FromSeconds(30),
-                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
-            });
 
         ConfigureAppSettingsServices(services);
         ConfigureCoreLogicServices(services);
@@ -503,6 +474,10 @@ public partial class App : Application
         services.AddSingleton<IAudioPlayer>(provider =>
             new LibVlcAudioPlayerService(provider.GetRequiredService<IDispatcherService>(),
                 provider.GetRequiredService<ILogger<LibVlcAudioPlayerService>>()));
+        services.AddSingleton<ITaskbarService>(provider =>
+            new TaskbarService(
+                provider.GetRequiredService<ILogger<TaskbarService>>(),
+                provider.GetRequiredService<IMusicPlaybackService>()));
     }
 
     private static void ConfigureViewModels(IServiceCollection services)
@@ -532,18 +507,12 @@ public partial class App : Application
         try
         {
             var dbContextFactory = services.GetRequiredService<IDbContextFactory<MusicDbContext>>();
-            await using var dbContext = await dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
-            
-            // Enable WAL mode for better concurrency and performance.
-            // This is more reliable than setting it in the connection string for Microsoft.Data.Sqlite.
-            await dbContext.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;").ConfigureAwait(false);
-            
-            await dbContext.Database.MigrateAsync().ConfigureAwait(false);
+            await using var dbContext = await dbContextFactory.CreateDbContextAsync();
+            await dbContext.Database.MigrateAsync();
         }
         catch (Exception ex)
         {
             Log.Fatal(ex, "Failed to initialize or migrate database.");
-            throw; // Re-throw to propagate the failure to the startup handler.
         }
     }
 
@@ -664,16 +633,11 @@ public partial class App : Application
     private void OnAppUnhandledException(object sender, UnhandledExceptionEventArgs e)
     {
         e.Handled = true;
-        _ = ShowCrashReportAndExitAsync(e.Exception);
-    }
-
-    private async Task ShowCrashReportAndExitAsync(Exception ex)
-    {
-        var exceptionDetails = ex.ToString();
+        var exceptionDetails = e.Exception.ToString();
         var originalLogPath = _currentLogFilePath ?? "Not set";
 
-        Log.Fatal(ex,
-            "A critical error occurred. Application will now terminate. Log path: {LogPath}",
+        Log.Fatal(e.Exception,
+            "An unhandled exception occurred. Application will now terminate. Log path at time of crash: {LogPath}",
             originalLogPath);
 
         // Primary strategy: Get logs from the in-memory sink.
@@ -683,8 +647,8 @@ public partial class App : Application
         if (string.IsNullOrWhiteSpace(logContent))
             try
             {
-                await Task.Delay(250).ConfigureAwait(false);
-                logContent = await File.ReadAllTextAsync(originalLogPath).ConfigureAwait(false);
+                Thread.Sleep(250);
+                logContent = File.ReadAllText(originalLogPath);
             }
             catch (Exception fileEx)
             {
@@ -694,31 +658,17 @@ public partial class App : Application
                     $"Error: {fileEx.Message}";
             }
 
-        var fullCrashReport = $"{logContent}\n\n--- EXCEPTION DETAILS ---\n{exceptionDetails}";
+        var fullCrashReport = $"{logContent}\n\n--- UNHANDLED EXCEPTION DETAILS ---\n{exceptionDetails}";
 
         if (MainDispatcherQueue == null)
         {
-            await Log.CloseAndFlushAsync();
+            Log.CloseAndFlush();
             Current?.Exit();
             Process.GetCurrentProcess().Kill();
             return;
         }
 
-        var dispatcherService = Services?.GetService<IDispatcherService>();
-        if (dispatcherService == null && MainDispatcherQueue != null)
-        {
-            dispatcherService = new DispatcherService(MainDispatcherQueue);
-        }
-
-        if (dispatcherService == null)
-        {
-            await Log.CloseAndFlushAsync();
-            Current?.Exit();
-            Process.GetCurrentProcess().Kill();
-            return;
-        }
-
-        await dispatcherService.EnqueueAsync(async () =>
+        MainDispatcherQueue.TryEnqueue(async () =>
         {
             try
             {
@@ -726,7 +676,7 @@ public partial class App : Application
                 if (uiService != null)
                 {
                     var result = await uiService.ShowCrashReportDialogAsync(
-                        "Critical Error",
+                        "Application Error",
                         "Nagi has encountered a critical error and must close. We are sorry for the inconvenience.",
                         fullCrashReport,
                         "https://github.com/Anthonyy232/Nagi/issues"
@@ -745,7 +695,7 @@ public partial class App : Application
             }
             finally
             {
-                await Log.CloseAndFlushAsync();
+                Log.CloseAndFlush();
                 Current?.Exit();
                 Process.GetCurrentProcess().Kill();
             }
@@ -935,6 +885,7 @@ public partial class App : Application
         if (hasFolders)
         {
             if (RootWindow.Content is not MainPage) RootWindow.Content = new MainPage();
+            await Services.GetRequiredService<LibraryViewModel>().InitializeAsync();
         }
         else
         {
